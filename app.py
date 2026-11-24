@@ -35,15 +35,14 @@ def client():
     )
 
 
-BUCKET = st.secrets["S3_BUCKET"].strip().replace("s3://", "").strip("/")
-if "/" in BUCKET:
-    st.error("S3_BUCKET harus nama bucket saja, tanpa garis miring.")
-    st.stop()
+_raw = st.secrets["S3_BUCKET"].strip().replace("s3://", "").strip("/")
+BUCKET, _, _pref = _raw.partition("/")   # "cilaavv/kirimpelanggan" -> bucket "cilaavv", prefix "kirimpelanggan/"
+PREFIX = (_pref.strip("/") + "/") if _pref else ""
 
 
 def get(key, default):
     try:
-        body = client().get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        body = client().get_object(Bucket=BUCKET, Key=PREFIX + key)["Body"].read()
         return json.loads(body)
     except ClientError:
         return default
@@ -51,7 +50,7 @@ def get(key, default):
 
 def put(key, obj):
     client().put_object(
-        Bucket=BUCKET, Key=key,
+        Bucket=BUCKET, Key=PREFIX + key,
         Body=json.dumps(obj, ensure_ascii=False).encode(),
         ContentType="application/json",
     )
@@ -59,7 +58,7 @@ def put(key, obj):
 
 def get_bytes(key):
     try:
-        return client().get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        return client().get_object(Bucket=BUCKET, Key=PREFIX + key)["Body"].read()
     except ClientError:
         return None
 
@@ -70,12 +69,12 @@ def cleanup(day):
     for prefix in ("db/", "claims/"):
         token = None
         while True:
-            kw = {"Bucket": BUCKET, "Prefix": prefix}
+            kw = {"Bucket": BUCKET, "Prefix": PREFIX + prefix}
             if token:
                 kw["ContinuationToken"] = token
             r = client().list_objects_v2(**kw)
             for o in r.get("Contents", []):
-                parts = o["Key"].split("/")
+                parts = o["Key"][len(PREFIX):].split("/")
                 if len(parts) > 1 and parts[1] != day:
                     client().delete_object(Bucket=BUCKET, Key=o["Key"])
             if not r.get("IsTruncated"):
@@ -85,7 +84,7 @@ def cleanup(day):
 
 
 try:
-    client().list_objects_v2(Bucket=BUCKET, MaxKeys=1)
+    client().list_objects_v2(Bucket=BUCKET, Prefix=PREFIX, MaxKeys=1)
 except ClientError as e:
     err = e.response.get("Error", {})
     st.error(f"S3 error: {err.get('Code')} - {err.get('Message')}")
@@ -229,7 +228,7 @@ def user_page():
         for f in files:
             ext = f.name.rsplit(".", 1)[-1].lower()
             key = f"proofs/{today()}/{user}-{uuid.uuid4().hex[:8]}.{ext}"
-            client().put_object(Bucket=BUCKET, Key=key, Body=f.getvalue())
+            client().put_object(Bucket=BUCKET, Key=PREFIX + key, Body=f.getvalue())
             proofs.append({"id": uuid.uuid4().hex, "user": user, "date": today(),
                            "key": key, "status": "pending",
                            "time": datetime.now(WIB).isoformat()})

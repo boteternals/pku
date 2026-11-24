@@ -1,4 +1,7 @@
-import hashlib, json, secrets, uuid
+import hashlib
+import json
+import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -23,21 +26,42 @@ def rp(n):
 
 
 # ---------------- Storage (bucket S3 Hugging Face) ----------------
-@st.cache_resource
-def client():
-    return boto3.client(
-        "s3",
-        endpoint_url=st.secrets["S3_ENDPOINT"].strip(),
-        aws_access_key_id=st.secrets["S3_ACCESS_KEY"].strip(),
-        aws_secret_access_key=st.secrets["S3_SECRET_KEY"].strip(),
-        region_name=st.secrets.get("S3_REGION", "us-east-1"),
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
-
+_EP = st.secrets["S3_ENDPOINT"].strip().rstrip("/")
+_AK = st.secrets["S3_ACCESS_KEY"].strip()
+_SK = st.secrets["S3_SECRET_KEY"].strip()
+_RG = st.secrets.get("S3_REGION", "us-east-1").strip()
 
 _raw = st.secrets["S3_BUCKET"].strip().replace("s3://", "").strip("/")
 BUCKET, _, _pref = _raw.partition("/")   # "cilaavv/kirimpelanggan" -> bucket "cilaavv", prefix "kirimpelanggan/"
 PREFIX = (_pref.strip("/") + "/") if _pref else ""
+
+
+@st.cache_resource
+def _build_client(endpoint, ak, sk, region):
+    try:
+        cfg = Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        )
+    except TypeError:
+        cfg = Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        )
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=ak,
+        aws_secret_access_key=sk,
+        region_name=region,
+        config=cfg,
+    )
+
+
+def client():
+    return _build_client(_EP, _AK, _SK, _RG)
 
 
 def get(key, default):
@@ -50,7 +74,8 @@ def get(key, default):
 
 def put(key, obj):
     client().put_object(
-        Bucket=BUCKET, Key=PREFIX + key,
+        Bucket=BUCKET,
+        Key=PREFIX + key,
         Body=json.dumps(obj, ensure_ascii=False).encode(),
         ContentType="application/json",
     )
@@ -88,6 +113,10 @@ try:
 except ClientError as e:
     err = e.response.get("Error", {})
     st.error(f"S3 error: {err.get('Code')} - {err.get('Message')}")
+    st.caption(
+        f"Info Koneksi -> Endpoint: `{_EP}` | Bucket: `{BUCKET}` | Prefix: `{PREFIX}` | "
+        f"AK: `{_AK[:6]}...` (panjang: {len(_AK)}) | SK panjang: {len(_SK)}"
+    )
     st.stop()
 
 cleanup(today())
@@ -108,9 +137,14 @@ def register(username, pw):
     if u in users:
         return "Username sudah dipakai."
     salt = secrets.token_hex(16)
-    users[u] = {"salt": salt, "pw": hash_pw(pw, salt), "balance": 0,
-                "account": None, "banned": False,
-                "created": datetime.now(WIB).isoformat()}
+    users[u] = {
+        "salt": salt,
+        "pw": hash_pw(pw, salt),
+        "balance": 0,
+        "account": None,
+        "banned": False,
+        "created": datetime.now(WIB).isoformat(),
+    }
     put("users.json", users)
     return None
 
@@ -210,9 +244,12 @@ def user_page():
         c = st.columns([4, 2])
         d = item["data"]
         c[0].write(d if isinstance(d, str) else json.dumps(d, ensure_ascii=False))
-        val = c[1].checkbox("Selesai" if item["status"] else "Belum Selesai",
-                            value=item["status"], key=f"st_{item['id']}",
-                            disabled=item["credited"])
+        val = c[1].checkbox(
+            "Selesai" if item["status"] else "Belum Selesai",
+            value=item["status"],
+            key=f"st_{item['id']}",
+            disabled=item["credited"],
+        )
         if val != item["status"]:
             mine[i]["status"] = val
             changed = True
@@ -229,9 +266,14 @@ def user_page():
             ext = f.name.rsplit(".", 1)[-1].lower()
             key = f"proofs/{today()}/{user}-{uuid.uuid4().hex[:8]}.{ext}"
             client().put_object(Bucket=BUCKET, Key=PREFIX + key, Body=f.getvalue())
-            proofs.append({"id": uuid.uuid4().hex, "user": user, "date": today(),
-                           "key": key, "status": "pending",
-                           "time": datetime.now(WIB).isoformat()})
+            proofs.append({
+                "id": uuid.uuid4().hex,
+                "user": user,
+                "date": today(),
+                "key": key,
+                "status": "pending",
+                "time": datetime.now(WIB).isoformat(),
+            })
         put("proofs.json", proofs)
         st.success("Bukti terkirim, menunggu verifikasi admin.")
 
@@ -257,9 +299,14 @@ def user_page():
             users[user]["balance"] = bal - amt
             put("users.json", users)
             wd = get("wd.json", [])
-            wd.append({"id": uuid.uuid4().hex, "user": user, "amount": int(amt),
-                       "account": users[user]["account"], "status": "pending",
-                       "time": datetime.now(WIB).isoformat()})
+            wd.append({
+                "id": uuid.uuid4().hex,
+                "user": user,
+                "amount": int(amt),
+                "account": users[user]["account"],
+                "status": "pending",
+                "time": datetime.now(WIB).isoformat(),
+            })
             put("wd.json", wd)
             st.success("Pengajuan WD dikirim.")
             st.rerun()
@@ -283,8 +330,11 @@ def admin_page():
         pool = get(f"db/{d}/pool.json", [])
         assigned = get(f"db/{d}/assigned.json", {})
         st.write(f"Tanggal {d} (WIB): total {len(pool)}, terpakai {len(assigned)}, sisa {len(pool) - len(assigned)}")
-        raw = st.text_area("Tempel JSON (list string/objek)", height=150,
-                           placeholder='["item1", "item2"] atau [{"nama":"A"}]')
+        raw = st.text_area(
+            "Tempel JSON (list string/objek)",
+            height=150,
+            placeholder='["item1", "item2"] atau [{"nama":"A"}]',
+        )
         up = st.file_uploader("atau upload file .json", type=["json"])
         if st.button("Tambahkan ke stok hari ini"):
             try:
@@ -348,7 +398,10 @@ def admin_page():
                     put("users.json", users)
                 put("wd.json", wd)
                 st.rerun()
-        st.caption("Riwayat: " + ", ".join(f"{w['user']} {rp(w['amount'])} {w['status']}" for w in wd[-10:] if w["status"] != "pending"))
+        st.caption(
+            "Riwayat: "
+            + ", ".join(f"{w['user']} {rp(w['amount'])} {w['status']}" for w in wd[-10:] if w["status"] != "pending")
+        )
 
     with t_up:
         proofs = get("proofs.json", [])
@@ -378,7 +431,10 @@ def admin_page():
                 p["status"] = "ditolak"
                 put("proofs.json", proofs)
                 st.rerun()
-        st.caption(f"Disetujui: {sum(1 for p in proofs if p['status']=='disetujui')}, ditolak: {sum(1 for p in proofs if p['status']=='ditolak')}")
+        st.caption(
+            f"Disetujui: {sum(1 for p in proofs if p['status']=='disetujui')}, "
+            f"ditolak: {sum(1 for p in proofs if p['status']=='ditolak')}"
+        )
 
     with t_set:
         s = get("settings.json", {"text": ""})

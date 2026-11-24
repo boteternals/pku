@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 import streamlit as st
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 st.set_page_config(page_title="KirimPelanggan", page_icon="📨", layout="centered")
@@ -26,14 +27,18 @@ def rp(n):
 def client():
     return boto3.client(
         "s3",
-        endpoint_url=st.secrets["S3_ENDPOINT"],
-        aws_access_key_id=st.secrets["S3_ACCESS_KEY"],
-        aws_secret_access_key=st.secrets["S3_SECRET_KEY"],
+        endpoint_url=st.secrets["S3_ENDPOINT"].strip(),
+        aws_access_key_id=st.secrets["S3_ACCESS_KEY"].strip(),
+        aws_secret_access_key=st.secrets["S3_SECRET_KEY"].strip(),
         region_name=st.secrets.get("S3_REGION", "us-east-1"),
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
 
 
-BUCKET = st.secrets["S3_BUCKET"]
+BUCKET = st.secrets["S3_BUCKET"].strip().replace("s3://", "").strip("/")
+if "/" in BUCKET:
+    st.error("S3_BUCKET harus nama bucket saja, tanpa garis miring.")
+    st.stop()
 
 
 def get(key, default):
@@ -78,6 +83,13 @@ def cleanup(day):
             token = r["NextContinuationToken"]
     return True
 
+
+try:
+    client().list_objects_v2(Bucket=BUCKET, MaxKeys=1)
+except ClientError as e:
+    err = e.response.get("Error", {})
+    st.error(f"S3 error: {err.get('Code')} - {err.get('Message')}")
+    st.stop()
 
 cleanup(today())
 

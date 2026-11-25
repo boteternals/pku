@@ -1,33 +1,39 @@
 """
 KirimPelanggan — platform mitra untuk mengerjakan tugas pelanggan.
 
-Runtime : Streamlit Community Cloud
-Penyimpanan : S3-compatible (Hugging Face bucket), JSON per-key
-Auth : PBKDF2-HMAC-SHA256, 120k iterasi
+Runtime     : Streamlit Community Cloud
+Storage     : S3-compatible (Hugging Face bucket), JSON per-key
+Auth        : PBKDF2-HMAC-SHA256, 120.000 iterasi
+Tema        : mendukung light & dark
 
-Secret yang dibutuhkan (st.secrets):
+Secret (st.secrets):
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET
-    S3_REGION      (opsional, default us-east-1)
+    S3_REGION          (opsional, default us-east-1)
     ADMIN_PASSWORD
 
 Catatan konsistensi
 -------------------
-Read-modify-write pada JSON di S3 tidak atomik. Aplikasi ini mengasumsikan
-satu penulis per key pada satu waktu (pola operasional wajar untuk skala ini).
-Untuk skala lebih besar, migrasikan ke DynamoDB/SQLite di volume persisten.
+Read-modify-write JSON di S3 tidak atomik. Diasumsikan satu penulis per key
+pada satu waktu — memadai untuk skala operasional saat ini. Untuk skala lebih
+besar migrasikan ke DynamoDB/SQLite di volume persisten.
 """
-import hashlib, json, secrets, uuid
+import hashlib
+import html as html_lib
+import json
+import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import boto3
 import streamlit as st
+import streamlit.components.v1 as components
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 # ---------------------------------------------------------------- Konfigurasi
 st.set_page_config(page_title="KirimPelanggan", page_icon="📨", layout="centered")
 
-RATE = 1500      # Rp per DB selesai
+RATE = 1500      # Rp per entri selesai
 MIN_WD = 10000   # minimal penarikan
 DAILY = 100      # batas klaim per user per hari
 WIB = timezone(timedelta(hours=7))
@@ -40,6 +46,10 @@ def today() -> str:
 def rp(n) -> str:
     t = f"{float(n):,.2f}"
     return "Rp" + t.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def rp_short(n) -> str:
+    return "Rp" + f"{int(n):,}".replace(",", ".")
 
 
 # ---------------------------------------------------------------- Storage
@@ -150,7 +160,7 @@ def login(username: str, pw: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------- Klaim DB
+# ---------------------------------------------------------------- Klaim
 def claim_key(user: str) -> str:
     return f"claims/{today()}/{user}.json"
 
@@ -165,7 +175,7 @@ def request_db(user: str, n: int) -> tuple[int, str | None]:
     assigned = get(f"db/{d}/assigned.json", {})
     free = [x for x in pool if x["id"] not in assigned][:n]
     if not free:
-        return 0, "Stok DB hari ini habis."
+        return 0, "Stok entri hari ini habis."
     for x in free:
         assigned[x["id"]] = user
         mine.append({"id": x["id"], "data": x["data"], "status": False, "credited": False})
@@ -174,10 +184,80 @@ def request_db(user: str, n: int) -> tuple[int, str | None]:
     return len(free), None
 
 
-# ---------------------------------------------------------------- Dialog
+# ---------------------------------------------------------------- Komponen visual
+def is_dark() -> bool:
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:
+        return False
+
+
+def copy_block(text: str, label: str = "Teks dari admin"):
+    """Blok teks dengan tombol salin (Clipboard API + fallback execCommand)."""
+    if not text.strip():
+        st.caption("Belum ada teks dari admin.")
+        return
+
+    payload = json.dumps(text, ensure_ascii=False).replace("</", "<\\/")
+    safe = html_lib.escape(text)
+    lines = text.count("\n") + 1
+    height = max(150, min(70 + lines * 22 + 50, 560))
+
+    if is_dark():
+        bg, fg, border, muted = "#0f172a", "#e2e8f0", "#1e293b", "#94a3b8"
+    else:
+        bg, fg, border, muted = "#ffffff", "#0f172a", "#e2e8f0", "#64748b"
+
+    components.html(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:transparent;
+       font-family:'Inter',-apple-system,system-ui,sans-serif}}
+  .wrap{{background:{bg};border:1px solid {border};border-radius:12px;
+        overflow:hidden;color:{fg}}}
+  .head{{display:flex;justify-content:space-between;align-items:center;
+        padding:10px 14px;border-bottom:1px solid {border};
+        font-size:11px;font-weight:600;text-transform:uppercase;
+        letter-spacing:.08em;color:{muted}}}
+  .btn{{background:transparent;color:{fg};border:1px solid {border};
+       border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;
+       font-weight:500;font-family:inherit;transition:background .15s}}
+  .btn:hover{{background:{border}}}
+  .btn:active{{transform:scale(.97)}}
+  pre{{margin:0;padding:16px 18px;white-space:pre-wrap;word-break:break-word;
+      font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;
+      line-height:1.6}}
+</style></head><body>
+<div class="wrap">
+  <div class="head"><span>{label}</span>
+    <button class="btn" id="cp" type="button">Salin</button>
+  </div>
+  <pre>{safe}</pre>
+</div>
+<script>
+  const txt = {payload};
+  const btn = document.getElementById('cp');
+  btn.addEventListener('click', async () => {{
+    try {{
+      await navigator.clipboard.writeText(txt);
+    }} catch (e) {{
+      const ta = document.createElement('textarea');
+      ta.value = txt;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }}
+    btn.textContent = 'Tersalin';
+    setTimeout(() => btn.textContent = 'Salin', 1500);
+  }});
+</script>
+</body></html>""", height=height)
+
+
 @st.dialog("Rekening penarikan")
 def account_dialog():
-    st.caption("Isi rekening atau e-wallet untuk proses withdraw.")
+    st.caption("Isi rekening atau e-wallet tujuan penarikan.")
     kind = st.selectbox(
         "Tujuan",
         ["DANA", "OVO", "GoPay", "ShopeePay", "BCA", "BRI", "BNI", "Mandiri", "Lainnya"],
@@ -209,129 +289,180 @@ def user_page():
     if not me.get("account"):
         account_dialog()
 
-    # Kartu saldo
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 2])
-        c1.caption("SALDO")
-        c1.markdown(f"### {rp(me['balance'])}")
-        c2.caption("AKUN")
-        c2.markdown(f"`@{user}`")
-    top = st.columns([3, 1])
-    top[0].write(f"Selamat datang, **{user}**.")
+    top = st.columns([4, 1], vertical_alignment="center")
+    top[0].markdown(
+        f'<div style="font-size:.78rem;font-weight:600;letter-spacing:.08em;'
+        f'text-transform:uppercase;color:rgba(128,128,128,1);">Dashboard mitra</div>'
+        f'<div style="font-size:1.15rem;font-weight:600;margin-top:2px;">@{user}</div>',
+        unsafe_allow_html=True,
+    )
     if top[1].button("Keluar", use_container_width=True):
         st.session_state.pop("user", None)
         st.switch_page(P_HOME)
 
-    # Minta DB
-    st.subheader("Minta DB")
-    with st.form("claim_form"):
-        n = st.number_input("Jumlah", min_value=1, max_value=DAILY, value=10, step=1)
-        submit = st.form_submit_button("Minta", type="primary", use_container_width=True)
-    if submit:
-        with st.spinner("Menyiapkan…"):
-            got, err = request_db(user, int(n))
-        if err:
-            st.warning(err)
-        else:
-            st.success(f"{got} entri ditambahkan.")
-            st.rerun()
+    st.markdown(f"""
+    <div class="kp-balance">
+      <div class="kp-balance-label">Saldo tersedia</div>
+      <div class="kp-balance-value">{rp(me['balance'])}</div>
+      <div class="kp-balance-meta">Minimal penarikan {rp_short(MIN_WD)} · tarif {rp_short(RATE)} per entri selesai</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Teks admin
-    st.subheader("Teks dari admin")
-    text = get("settings.json", {"text": ""}).get("text", "").strip()
-    if text:
-        st.code(text, language=None)
-    else:
-        st.caption("Belum ada teks dari admin.")
-
-    # Daftar klaim
     mine = get(claim_key(user), [])
-    st.subheader(f"DB hari ini · {len(mine)}/{DAILY}")
-    changed = False
-    for i, item in enumerate(mine):
-        with st.container(border=True):
-            left, right = st.columns([4, 2])
-            d = item["data"]
-            left.code(d if isinstance(d, str) else json.dumps(d, ensure_ascii=False), language=None)
-            val = right.checkbox(
-                "Selesai" if item["status"] else "Belum selesai",
-                value=item["status"], key=f"st_{item['id']}",
-                disabled=item["credited"],
+    done = sum(1 for x in mine if x["status"])
+    pending = sum(1 for x in mine if x["status"] and not x["credited"])
+
+    s1, s2, s3 = st.columns(3)
+    for col, val, lbl in (
+        (s1, f"{len(mine)}/{DAILY}", "Klaim hari ini"),
+        (s2, str(done), "Selesai"),
+        (s3, str(pending), "Menunggu verifikasi"),
+    ):
+        col.markdown(f"""
+        <div class="kp-stat">
+          <div class="kp-stat-v">{val}</div>
+          <div class="kp-stat-l">{lbl}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.write("")
+    tab_kerja, tab_wd = st.tabs(["Kerjakan", "Penarikan"])
+
+    with tab_kerja:
+        st.markdown('<div class="kp-section-label">1 · Instruksi admin</div>',
+                    unsafe_allow_html=True)
+        text = get("settings.json", {"text": ""}).get("text", "")
+        copy_block(text, "Teks dari admin")
+
+        st.markdown('<div class="kp-section-label">2 · Minta entri</div>',
+                    unsafe_allow_html=True)
+        with st.form("claim_form"):
+            n = st.number_input(
+                f"Jumlah (maks {DAILY} per hari)", min_value=1,
+                max_value=max(1, DAILY - len(mine)), value=min(10, max(1, DAILY - len(mine))),
+                step=1,
             )
-        if val != item["status"]:
-            mine[i]["status"] = val
-            changed = True
-    if changed:
-        put(claim_key(user), mine)
-        st.rerun()
+            submit = st.form_submit_button("Minta", type="primary", use_container_width=True)
+        if submit:
+            with st.spinner("Menyiapkan…"):
+                got, err = request_db(user, int(n))
+            if err:
+                st.warning(err)
+            else:
+                st.success(f"{got} entri ditambahkan ke akun Anda.")
+                st.rerun()
 
-    # Upload bukti
-    st.subheader("Bukti pengerjaan")
-    files = st.file_uploader(
-        "Unggah foto (PNG/JPG/WEBP)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-    )
-    if st.button("Kirim bukti", disabled=not files):
-        proofs = get("proofs.json", [])
-        for f in files:
-            ext = f.name.rsplit(".", 1)[-1].lower()
-            key = f"proofs/{today()}/{user}-{uuid.uuid4().hex[:8]}.{ext}"
-            client().put_object(Bucket=BUCKET, Key=PREFIX + key, Body=f.getvalue())
-            proofs.append({
-                "id": uuid.uuid4().hex, "user": user, "date": today(),
-                "key": key, "status": "pending",
-                "time": datetime.now(WIB).isoformat(),
-            })
-        put("proofs.json", proofs)
-        st.success("Bukti terkirim. Menunggu verifikasi admin.")
-
-    # Withdraw
-    st.divider()
-    st.subheader("Penarikan")
-    acc = me["account"]
-    if acc:
-        st.caption(f"Tujuan: {acc['type']} · {acc['number']} · a.n. {acc['name']}")
-    if st.button("Ubah rekening"):
-        account_dialog()
-
-    with st.form("wd_form"):
-        amt = st.number_input(
-            f"Jumlah (minimal {rp(MIN_WD)})",
-            min_value=MIN_WD, step=1000, value=MIN_WD,
-        )
-        submit = st.form_submit_button("Ajukan penarikan", type="primary", use_container_width=True)
-    if submit:
-        users = get("users.json", {})
-        bal = users[user]["balance"]
-        if amt > bal:
-            st.error("Saldo tidak mencukupi.")
-        elif not users[user]["account"]:
-            st.error("Daftarkan rekening terlebih dahulu.")
-        else:
-            users[user]["balance"] = bal - int(amt)
-            put("users.json", users)
-            wd = get("wd.json", [])
-            wd.append({
-                "id": uuid.uuid4().hex, "user": user, "amount": int(amt),
-                "account": users[user]["account"], "status": "pending",
-                "time": datetime.now(WIB).isoformat(),
-            })
-            put("wd.json", wd)
-            st.success("Pengajuan terkirim.")
+        st.markdown('<div class="kp-section-label">3 · Daftar entri</div>',
+                    unsafe_allow_html=True)
+        if not mine:
+            st.caption("Belum ada entri. Ajukan lewat formulir di atas.")
+        changed = False
+        for i, item in enumerate(mine):
+            with st.container(border=True):
+                left, right = st.columns([4, 1], vertical_alignment="center")
+                d = item["data"]
+                left.code(
+                    d if isinstance(d, str) else json.dumps(d, ensure_ascii=False),
+                    language=None,
+                )
+                val = right.checkbox(
+                    "Selesai" if item["status"] else "Belum",
+                    value=item["status"], key=f"st_{item['id']}",
+                    disabled=item["credited"],
+                )
+            if val != item["status"]:
+                mine[i]["status"] = val
+                changed = True
+        if changed:
+            put(claim_key(user), mine)
             st.rerun()
 
-    my_wd = [w for w in get("wd.json", []) if w["user"] == user][-10:]
-    if my_wd:
-        st.caption("Riwayat penarikan")
-        for w in reversed(my_wd):
-            st.write(f"{w['time'][:16]} · {rp(w['amount'])} · {w['status']}")
+        st.markdown('<div class="kp-section-label">4 · Unggah bukti</div>',
+                    unsafe_allow_html=True)
+        files = st.file_uploader(
+            "Unggah foto bukti pengerjaan",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        if st.button("Kirim bukti", type="primary", disabled=not files,
+                     use_container_width=True):
+            proofs = get("proofs.json", [])
+            for f in files:
+                ext = f.name.rsplit(".", 1)[-1].lower()
+                key = f"proofs/{today()}/{user}-{uuid.uuid4().hex[:8]}.{ext}"
+                client().put_object(Bucket=BUCKET, Key=PREFIX + key, Body=f.getvalue())
+                proofs.append({
+                    "id": uuid.uuid4().hex, "user": user, "date": today(),
+                    "key": key, "status": "pending",
+                    "time": datetime.now(WIB).isoformat(),
+                })
+            put("proofs.json", proofs)
+            st.success("Bukti terkirim. Menunggu verifikasi admin.")
+
+    with tab_wd:
+        acc = me["account"]
+        st.markdown('<div class="kp-section-label">Rekening tujuan</div>',
+                    unsafe_allow_html=True)
+        if acc:
+            st.markdown(f"""
+            <div class="kp-callout">
+              <div class="kp-callout-title">{acc['type']} · {acc['number']}</div>
+              <div style="color:rgba(128,128,128,1);font-size:.92rem;">a.n. {acc['name']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.caption("Rekening belum didaftarkan.")
+        if st.button("Ubah rekening"):
+            account_dialog()
+
+        st.markdown('<div class="kp-section-label">Ajukan penarikan</div>',
+                    unsafe_allow_html=True)
+        with st.form("wd_form"):
+            amt = st.number_input(
+                f"Jumlah (minimal {rp_short(MIN_WD)})",
+                min_value=MIN_WD, step=1000, value=MIN_WD,
+            )
+            submit = st.form_submit_button("Ajukan penarikan", type="primary",
+                                           use_container_width=True)
+        if submit:
+            users = get("users.json", {})
+            bal = users[user]["balance"]
+            if amt > bal:
+                st.error("Saldo tidak mencukupi.")
+            elif not users[user]["account"]:
+                st.error("Daftarkan rekening terlebih dahulu.")
+            else:
+                users[user]["balance"] = bal - int(amt)
+                put("users.json", users)
+                wd = get("wd.json", [])
+                wd.append({
+                    "id": uuid.uuid4().hex, "user": user, "amount": int(amt),
+                    "account": users[user]["account"], "status": "pending",
+                    "time": datetime.now(WIB).isoformat(),
+                })
+                put("wd.json", wd)
+                st.success("Pengajuan terkirim.")
+                st.rerun()
+
+        my_wd = [w for w in get("wd.json", []) if w["user"] == user][-10:]
+        if my_wd:
+            st.markdown('<div class="kp-section-label">Riwayat</div>',
+                        unsafe_allow_html=True)
+            for w in reversed(my_wd):
+                st.write(f"`{w['time'][:16]}` · **{rp(w['amount'])}** · {w['status']}")
 
 
 # ---------------------------------------------------------------- Halaman admin
 def admin_page():
     if not st.session_state.get("admin"):
-        st.subheader("Admin")
+        st.markdown("""
+        <div style="margin:8px 0 20px;">
+          <div style="font-size:.72rem;font-weight:600;letter-spacing:.08em;
+               text-transform:uppercase;color:rgba(128,128,128,1);margin-bottom:8px;">Internal</div>
+          <h1 style="font-size:1.75rem;font-weight:700;letter-spacing:-.025em;margin:0;">Admin</h1>
+        </div>
+        """, unsafe_allow_html=True)
         tries = st.session_state.get("admin_tries", 0)
         with st.form("admin_login"):
             p = st.text_input("Password admin", type="password")
@@ -348,17 +479,17 @@ def admin_page():
                 st.error("Password salah.")
         return
 
-    top = st.columns([3, 1])
+    top = st.columns([4, 1], vertical_alignment="center")
     top[0].subheader("Dashboard admin")
     if top[1].button("Keluar", use_container_width=True):
         st.session_state.pop("admin", None)
         st.rerun()
 
+    users = get("users.json", {})
+
     t_db, t_user, t_wd, t_up, t_set, t_home = st.tabs(
         ["Stok DB", "Pengguna", "Penarikan", "Bukti", "Teks", "Beranda"]
     )
-
-    users = get("users.json", {})
 
     with t_db:
         d = today()
@@ -430,7 +561,7 @@ def admin_page():
                 st.write(f"**{w['user']}** · {rp(w['amount'])}")
                 st.caption(f"{a['type']} · {a['number']} · a.n. {a['name']}")
                 c = st.columns(2)
-                if c[0].button("Sudah dibayar", key=f"p_{w['id']}"):
+                if c[0].button("Sudah dibayar", key=f"p_{w['id']}", type="primary"):
                     w["status"] = "dibayar"
                     put("wd.json", wd)
                     st.rerun()
@@ -460,7 +591,7 @@ def admin_page():
                 if img:
                     st.image(img, width=320)
                 c = st.columns(2)
-                if c[0].button("Setujui", key=f"a_{p['id']}"):
+                if c[0].button("Setujui", key=f"a_{p['id']}", type="primary"):
                     claims = get(f"claims/{p['date']}/{p['user']}.json", [])
                     n = 0
                     for x in claims:
@@ -507,63 +638,316 @@ def admin_page():
 def inject_css():
     st.markdown("""
 <style>
-.block-container { max-width: 720px; padding-top: 2rem; }
-h1, h2, h3 { letter-spacing: -0.01em; }
-.stButton > button, .stFormSubmitButton > button { border-radius: 8px; font-weight: 500; }
-div[data-testid="stMetricValue"] { font-size: 1.75rem; }
-code { font-size: 0.85rem; }
-</style>""", unsafe_allow_html=True)
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+html, body, [class*="css"], .stApp {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-feature-settings: 'cv11', 'ss01';
+  -webkit-font-smoothing: antialiased;
+}
+
+.block-container { max-width: 740px; padding-top: 2rem; padding-bottom: 4rem; }
+
+h1 { font-weight: 700; letter-spacing: -0.025em; }
+h2 { font-weight: 600; letter-spacing: -0.02em; }
+h3 { font-weight: 600; letter-spacing: -0.015em; }
+p  { line-height: 1.65; }
+
+code, pre, .kp-mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace !important;
+}
+
+/* Tombol */
+.stButton > button, .stFormSubmitButton > button {
+  border-radius: 8px; font-weight: 500; transition: all .15s ease;
+}
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {
+  font-weight: 600;
+}
+
+/* Nav link */
+a[data-testid="stPageLink-NavLink"] {
+  padding: 8px 14px !important;
+  border-radius: 8px !important;
+  text-decoration: none !important;
+  font-weight: 500 !important;
+  border: 1px solid transparent !important;
+  transition: background .15s ease, border-color .15s ease !important;
+}
+a[data-testid="stPageLink-NavLink"]:hover {
+  background: rgba(128,128,128,.08) !important;
+  border-color: rgba(128,128,128,.18) !important;
+}
+
+/* Container border */
+[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px !important; }
+
+/* Input & uploader */
+.stTextInput input, .stNumberInput input, .stTextArea textarea { border-radius: 8px !important; }
+[data-testid="stFileUploader"] section {
+  border-radius: 10px; border-style: dashed !important;
+}
+
+/* Brand */
+.kp-brand {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 700; font-size: 1rem; letter-spacing: -0.02em;
+  padding: 8px 0;
+}
+.kp-brand-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.18);
+}
+
+/* Hero */
+.kp-hero {
+  position: relative;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(99,102,241,0.28), transparent 55%),
+    linear-gradient(180deg, #0b1220 0%, #0f172a 100%);
+  color: #e2e8f0;
+  border-radius: 20px;
+  padding: 44px 36px 40px;
+  margin: 8px 0 20px;
+  border: 1px solid rgba(148,163,184,0.12);
+  overflow: hidden;
+}
+.kp-hero-badge {
+  display: inline-block; font-size: .7rem; font-weight: 600;
+  letter-spacing: .1em; text-transform: uppercase; color: #94a3b8;
+  border: 1px solid rgba(148,163,184,0.25); border-radius: 999px;
+  padding: 4px 10px; margin-bottom: 20px;
+}
+.kp-hero h1 {
+  font-size: 2.25rem; font-weight: 700; line-height: 1.15;
+  margin: 0 0 12px; color: #f8fafc; letter-spacing: -.03em;
+}
+.kp-hero p {
+  font-size: 1rem; line-height: 1.6; color: #94a3b8;
+  margin: 0; max-width: 500px;
+}
+
+/* Saldo */
+.kp-balance {
+  background:
+    radial-gradient(circle at 100% 0%, rgba(99,102,241,0.22), transparent 55%),
+    linear-gradient(180deg, #0b1220 0%, #0f172a 100%);
+  color: #e2e8f0;
+  border-radius: 18px; padding: 26px 28px 24px;
+  margin: 10px 0 16px;
+  border: 1px solid rgba(148,163,184,0.12);
+}
+.kp-balance-label {
+  font-size: .7rem; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: #64748b; margin-bottom: 6px;
+}
+.kp-balance-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 2.1rem; font-weight: 600; color: #f8fafc;
+  letter-spacing: -.02em; margin-bottom: 10px;
+}
+.kp-balance-meta { font-size: .82rem; color: #94a3b8; }
+
+/* Stats */
+.kp-stat {
+  background: var(--secondary-background-color, rgba(128,128,128,0.06));
+  border: 1px solid rgba(128,128,128,0.15);
+  border-radius: 12px; padding: 14px 16px;
+}
+.kp-stat-v {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.1rem; font-weight: 600; margin-bottom: 2px;
+}
+.kp-stat-l {
+  font-size: .72rem; color: rgba(128,128,128,1);
+  text-transform: uppercase; letter-spacing: .07em; font-weight: 500;
+}
+
+/* Section label */
+.kp-section-label {
+  font-size: .7rem; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: rgba(128,128,128,1);
+  margin: 28px 0 12px;
+}
+.kp-section-label:first-child { margin-top: 12px; }
+
+/* Steps */
+.kp-steps { display: flex; flex-direction: column; gap: 12px; }
+.kp-step {
+  display: flex; gap: 20px;
+  background: var(--secondary-background-color, rgba(128,128,128,0.05));
+  border: 1px solid rgba(128,128,128,0.15);
+  border-radius: 14px; padding: 20px 22px;
+}
+.kp-step-n {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .85rem; font-weight: 600; color: #6366f1;
+  flex-shrink: 0; width: 28px; padding-top: 2px;
+}
+.kp-step-t { font-weight: 600; margin-bottom: 4px; font-size: .98rem; }
+.kp-step-d {
+  color: rgba(128,128,128,1); font-size: .92rem; line-height: 1.6;
+}
+.kp-step-d b { color: inherit; font-weight: 600; }
+
+/* Callout */
+.kp-callout {
+  border-radius: 14px; padding: 18px 22px; margin: 8px 0 4px;
+  border: 1px solid rgba(128,128,128,0.15);
+  background: var(--secondary-background-color, rgba(128,128,128,0.05));
+}
+.kp-callout-title { font-weight: 600; margin-bottom: 8px; font-size: .92rem; }
+.kp-callout ul {
+  margin: 0; padding-left: 18px; font-size: .92rem;
+  line-height: 1.7; color: rgba(128,128,128,1);
+}
+.kp-callout li { margin-bottom: 6px; }
+.kp-callout li:last-child { margin-bottom: 0; }
+
+/* Navbar divider */
+.kp-nav-divider {
+  height: 1px; background: rgba(128,128,128,0.15); margin: 6px 0 24px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 def navbar():
-    c = st.columns(2)
-    c[0].page_link(P_HOME, label="Beranda", icon="🏠")
-    if st.session_state.get("user"):
-        c[1].page_link(P_USER, label="Dashboard", icon="👛")
-    else:
-        c[1].page_link(P_AUTH, label="Masuk / daftar", icon="🔑")
+    c = st.columns([3, 1, 1], vertical_alignment="center")
+    c[0].markdown(
+        '<div class="kp-brand"><span class="kp-brand-dot"></span>KirimPelanggan</div>',
+        unsafe_allow_html=True,
+    )
+    with c[1]:
+        st.page_link(P_HOME, label="Beranda")
+    with c[2]:
+        if st.session_state.get("user"):
+            st.page_link(P_USER, label="Dashboard")
+        else:
+            st.page_link(P_AUTH, label="Masuk")
+    st.markdown('<div class="kp-nav-divider"></div>', unsafe_allow_html=True)
 
 
-DOCS = f"""
-#### Cara kerja
-
-1. **Daftar & masuk.** Buat akun, lalu isi rekening/e-wallet tujuan penarikan saat pertama masuk.
-2. **Minta DB.** Tentukan jumlah (maks {DAILY} per hari). Setiap entri hanya diberikan ke satu pengguna.
-3. **Kerjakan.** Ikuti teks yang diberikan admin. Centang entri setelah selesai dikerjakan.
-4. **Upload bukti.** Kirim foto bukti. Setelah admin menyetujui, saldo bertambah **{rp(RATE)}** per entri selesai.
-5. **Withdraw.** Ajukan penarikan minimal **{rp(MIN_WD)}** ke rekening terdaftar.
-
-#### Ketentuan
-
-- Stok dan klaim direset otomatis setiap pukul **00.00 WIB**. Kerjakan dan unggah bukti pada hari yang sama.
-- Data pelanggan bersifat rahasia. Dilarang menyalin, menyimpan, atau membagikannya.
-- Hentikan komunikasi bila pelanggan meminta.
-- Pelanggaran berakibat pemblokiran akun dan penahanan saldo.
-"""
-
-
+# ---------------------------------------------------------------- Halaman publik
 def home_page():
     navbar()
-    st.title("KirimPelanggan")
-    st.caption("Platform mitra untuk mengerjakan tugas pelanggan.")
+
+    st.markdown("""
+    <div class="kp-hero">
+      <div class="kp-hero-badge">Platform mitra</div>
+      <h1>Kerjakan tugas pelanggan.<br>Dibayar per entri selesai.</h1>
+      <p>Ambil pekerjaan dari admin, selesaikan, unggah bukti. Saldo masuk setelah
+         diverifikasi. Tarik kapan saja ke rekening atau e-wallet Anda.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
     if st.session_state.get("user"):
-        st.page_link(P_USER, label="Buka dashboard", icon="👛")
+        st.page_link(P_USER, label="Buka dashboard", icon="→")
     else:
-        st.page_link(P_AUTH, label="Masuk atau daftar", icon="🔑")
-    st.divider()
-    st.markdown(DOCS)
-    st.divider()
-    st.subheader("Lisensi")
+        st.page_link(P_AUTH, label="Masuk atau daftar sekarang", icon="→")
+
+    st.write("")
+    s1, s2, s3 = st.columns(3)
+    for col, val, lbl in (
+        (s1, rp_short(RATE), "Per entri selesai"),
+        (s2, str(DAILY), "Klaim maks / hari"),
+        (s3, rp_short(MIN_WD), "Minimum penarikan"),
+    ):
+        col.markdown(f"""
+        <div class="kp-stat">
+          <div class="kp-stat-v">{val}</div>
+          <div class="kp-stat-l">{lbl}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<div class="kp-section-label">Alur kerja</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="kp-steps">
+      <div class="kp-step">
+        <div class="kp-step-n">01</div>
+        <div>
+          <div class="kp-step-t">Buat akun & daftarkan rekening</div>
+          <div class="kp-step-d">Isi username dan password. Saat pertama masuk, cantumkan
+            rekening bank atau e-wallet tujuan penarikan.</div>
+        </div>
+      </div>
+      <div class="kp-step">
+        <div class="kp-step-n">02</div>
+        <div>
+          <div class="kp-step-t">Minta entri dari stok harian</div>
+          <div class="kp-step-d">Tentukan jumlah, maksimal <b>{DAILY}</b> per hari. Setiap entri
+            bersifat eksklusif — hanya terkirim ke satu pengguna.</div>
+        </div>
+      </div>
+      <div class="kp-step">
+        <div class="kp-step-n">03</div>
+        <div>
+          <div class="kp-step-t">Kerjakan sesuai instruksi</div>
+          <div class="kp-step-d">Ikuti teks dari admin. Tandai entri sebagai <b>Selesai</b>
+            di dashboard setelah pekerjaan tuntas.</div>
+        </div>
+      </div>
+      <div class="kp-step">
+        <div class="kp-step-n">04</div>
+        <div>
+          <div class="kp-step-t">Unggah bukti pengerjaan</div>
+          <div class="kp-step-d">Kirim foto bukti. Setelah admin menyetujui, saldo bertambah
+            <b>{rp_short(RATE)}</b> untuk setiap entri berstatus selesai.</div>
+        </div>
+      </div>
+      <div class="kp-step">
+        <div class="kp-step-n">05</div>
+        <div>
+          <div class="kp-step-t">Cairkan ke rekening</div>
+          <div class="kp-step-d">Ajukan penarikan minimal <b>{rp_short(MIN_WD)}</b>. Admin
+            memproses transfer ke rekening yang Anda daftarkan.</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="kp-section-label">Ketentuan</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="kp-callout">
+      <div class="kp-callout-title">Baca sebelum memulai</div>
+      <ul>
+        <li>Stok dan klaim direset otomatis setiap pukul <b>00.00 WIB</b>.
+            Selesaikan pekerjaan dan unggah bukti pada hari yang sama.</li>
+        <li>Data pelanggan bersifat rahasia. Dilarang menyalin, menyimpan, atau
+            membagikannya ke pihak lain.</li>
+        <li>Hentikan komunikasi bila pelanggan meminta berhenti.</li>
+        <li>Pelanggaran berakibat pemblokiran akun dan penahanan saldo.</li>
+      </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="kp-section-label">Lisensi</div>', unsafe_allow_html=True)
     lic = get("settings.json", {}).get("license", "").strip()
-    st.markdown(lic or "_Belum diisi admin._")
+    if lic:
+        with st.container(border=True):
+            st.markdown(lic)
+    else:
+        st.caption("Belum diisi admin.")
 
 
 def auth_page():
     if st.session_state.get("user"):
         st.switch_page(P_USER)
     navbar()
-    st.title("Masuk ke akun mitra")
-    tab_l, tab_r = st.tabs(["Masuk", "Daftar"])
+
+    st.markdown("""
+    <div style="margin: 8px 0 24px;">
+      <div style="font-size:.7rem;font-weight:600;letter-spacing:.1em;
+           text-transform:uppercase;color:rgba(128,128,128,1);margin-bottom:10px;">
+        Akun mitra</div>
+      <h1 style="font-size:1.9rem;font-weight:700;letter-spacing:-.025em;margin:0 0 8px;">
+        Masuk atau daftar</h1>
+      <p style="color:rgba(128,128,128,1);font-size:.95rem;margin:0;line-height:1.6;">
+        Butuh sekitar 30 detik untuk memulai. Tidak ada biaya pendaftaran.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tab_l, tab_r = st.tabs(["Masuk", "Daftar baru"])
 
     with tab_l:
         with st.form("f_login"):

@@ -1,7 +1,4 @@
-import hashlib
-import json
-import secrets
-import uuid
+import hashlib, json, secrets, uuid
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -22,46 +19,26 @@ def today():
 
 
 def rp(n):
-    return "Rp{:,.0f}".format(n).replace(",", ".")
+    t = f"{float(n):,.2f}"
+    return "Rp" + t.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 # ---------------- Storage (bucket S3 Hugging Face) ----------------
-_EP = st.secrets["S3_ENDPOINT"].strip().rstrip("/")
-_AK = st.secrets["S3_ACCESS_KEY"].strip()
-_SK = st.secrets["S3_SECRET_KEY"].strip()
-_RG = st.secrets.get("S3_REGION", "us-east-1").strip()
+@st.cache_resource
+def client():
+    return boto3.client(
+        "s3",
+        endpoint_url=st.secrets["S3_ENDPOINT"].strip(),
+        aws_access_key_id=st.secrets["S3_ACCESS_KEY"].strip(),
+        aws_secret_access_key=st.secrets["S3_SECRET_KEY"].strip(),
+        region_name=st.secrets.get("S3_REGION", "us-east-1"),
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
 
 _raw = st.secrets["S3_BUCKET"].strip().replace("s3://", "").strip("/")
 BUCKET, _, _pref = _raw.partition("/")   # "cilaavv/kirimpelanggan" -> bucket "cilaavv", prefix "kirimpelanggan/"
 PREFIX = (_pref.strip("/") + "/") if _pref else ""
-
-
-@st.cache_resource
-def _build_client(endpoint, ak, sk, region):
-    try:
-        cfg = Config(
-            signature_version="s3v4",
-            s3={"addressing_style": "path"},
-            request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
-        )
-    except TypeError:
-        cfg = Config(
-            signature_version="s3v4",
-            s3={"addressing_style": "path"},
-        )
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=ak,
-        aws_secret_access_key=sk,
-        region_name=region,
-        config=cfg,
-    )
-
-
-def client():
-    return _build_client(_EP, _AK, _SK, _RG)
 
 
 def get(key, default):
@@ -74,8 +51,7 @@ def get(key, default):
 
 def put(key, obj):
     client().put_object(
-        Bucket=BUCKET,
-        Key=PREFIX + key,
+        Bucket=BUCKET, Key=PREFIX + key,
         Body=json.dumps(obj, ensure_ascii=False).encode(),
         ContentType="application/json",
     )
@@ -113,10 +89,6 @@ try:
 except ClientError as e:
     err = e.response.get("Error", {})
     st.error(f"S3 error: {err.get('Code')} - {err.get('Message')}")
-    st.caption(
-        f"Info Koneksi -> Endpoint: `{_EP}` | Bucket: `{BUCKET}` | Prefix: `{PREFIX}` | "
-        f"AK: `{_AK[:6]}...` (panjang: {len(_AK)}) | SK panjang: {len(_SK)}"
-    )
     st.stop()
 
 cleanup(today())
@@ -137,14 +109,9 @@ def register(username, pw):
     if u in users:
         return "Username sudah dipakai."
     salt = secrets.token_hex(16)
-    users[u] = {
-        "salt": salt,
-        "pw": hash_pw(pw, salt),
-        "balance": 0,
-        "account": None,
-        "banned": False,
-        "created": datetime.now(WIB).isoformat(),
-    }
+    users[u] = {"salt": salt, "pw": hash_pw(pw, salt), "balance": 0,
+                "account": None, "banned": False,
+                "created": datetime.now(WIB).isoformat()}
     put("users.json", users)
     return None
 
@@ -203,22 +170,28 @@ def request_db(user, n):
 
 # ---------------- Halaman user ----------------
 def user_page():
+    if not st.session_state.get("user"):
+        st.switch_page(P_AUTH)
     user = st.session_state.user
     users = get("users.json", {})
     me = users.get(user)
     if not me or me.get("banned"):
-        st.session_state.pop("user")
-        st.rerun()
+        st.session_state.pop("user", None)
+        st.switch_page(P_AUTH)
     if not me.get("account"):
         account_dialog()
 
+    st.markdown(
+        f'<div class="wallet"><div class="wl">Dompet / Saldo</div>'
+        f'<div class="wv">{rp(me["balance"])}</div>'
+        f'<div class="ws">@{user}</div></div>',
+        unsafe_allow_html=True,
+    )
     top = st.columns([3, 1])
-    top[0].subheader(f"Halo, {user}")
+    top[0].markdown(f"**Halo, {user}**")
     if top[1].button("Keluar"):
-        st.session_state.pop("user")
-        st.rerun()
-
-    st.metric("Saldo saat ini", rp(me["balance"]))
+        st.session_state.pop("user", None)
+        st.switch_page(P_HOME)
 
     # Minta DB
     n = st.number_input("Minta DB", min_value=1, max_value=DAILY, value=10, step=1)
@@ -244,12 +217,9 @@ def user_page():
         c = st.columns([4, 2])
         d = item["data"]
         c[0].write(d if isinstance(d, str) else json.dumps(d, ensure_ascii=False))
-        val = c[1].checkbox(
-            "Selesai" if item["status"] else "Belum Selesai",
-            value=item["status"],
-            key=f"st_{item['id']}",
-            disabled=item["credited"],
-        )
+        val = c[1].checkbox("Selesai" if item["status"] else "Belum Selesai",
+                            value=item["status"], key=f"st_{item['id']}",
+                            disabled=item["credited"])
         if val != item["status"]:
             mine[i]["status"] = val
             changed = True
@@ -266,14 +236,9 @@ def user_page():
             ext = f.name.rsplit(".", 1)[-1].lower()
             key = f"proofs/{today()}/{user}-{uuid.uuid4().hex[:8]}.{ext}"
             client().put_object(Bucket=BUCKET, Key=PREFIX + key, Body=f.getvalue())
-            proofs.append({
-                "id": uuid.uuid4().hex,
-                "user": user,
-                "date": today(),
-                "key": key,
-                "status": "pending",
-                "time": datetime.now(WIB).isoformat(),
-            })
+            proofs.append({"id": uuid.uuid4().hex, "user": user, "date": today(),
+                           "key": key, "status": "pending",
+                           "time": datetime.now(WIB).isoformat()})
         put("proofs.json", proofs)
         st.success("Bukti terkirim, menunggu verifikasi admin.")
 
@@ -299,14 +264,9 @@ def user_page():
             users[user]["balance"] = bal - amt
             put("users.json", users)
             wd = get("wd.json", [])
-            wd.append({
-                "id": uuid.uuid4().hex,
-                "user": user,
-                "amount": int(amt),
-                "account": users[user]["account"],
-                "status": "pending",
-                "time": datetime.now(WIB).isoformat(),
-            })
+            wd.append({"id": uuid.uuid4().hex, "user": user, "amount": int(amt),
+                       "account": users[user]["account"], "status": "pending",
+                       "time": datetime.now(WIB).isoformat()})
             put("wd.json", wd)
             st.success("Pengajuan WD dikirim.")
             st.rerun()
@@ -317,24 +277,38 @@ def user_page():
 
 # ---------------- Halaman admin ----------------
 def admin_page():
+    if not st.session_state.get("admin"):
+        st.subheader("🔐 Admin")
+        tries = st.session_state.get("admin_tries", 0)
+        with st.form("admin_login"):
+            p = st.text_input("Password admin", type="password")
+            ok = st.form_submit_button("Masuk", type="primary")
+        if ok:
+            if tries >= 5:
+                st.error("Terlalu banyak percobaan. Muat ulang halaman.")
+            elif secrets.compare_digest(p.encode(), st.secrets["ADMIN_PASSWORD"].encode()):
+                st.session_state.admin = True
+                st.rerun()
+            else:
+                st.session_state.admin_tries = tries + 1
+                st.error("Password salah.")
+        return
+
     top = st.columns([3, 1])
     top[0].subheader("Dashboard Admin")
     if top[1].button("Keluar"):
-        st.session_state.pop("admin")
+        st.session_state.pop("admin", None)
         st.rerun()
 
-    t_db, t_user, t_wd, t_up, t_set = st.tabs(["Isi DB", "User", "WD", "Upload", "Teks"])
+    t_db, t_user, t_wd, t_up, t_set, t_home = st.tabs(["Isi DB", "User", "WD", "Upload", "Teks", "Beranda"])
 
     with t_db:
         d = today()
         pool = get(f"db/{d}/pool.json", [])
         assigned = get(f"db/{d}/assigned.json", {})
         st.write(f"Tanggal {d} (WIB): total {len(pool)}, terpakai {len(assigned)}, sisa {len(pool) - len(assigned)}")
-        raw = st.text_area(
-            "Tempel JSON (list string/objek)",
-            height=150,
-            placeholder='["item1", "item2"] atau [{"nama":"A"}]',
-        )
+        raw = st.text_area("Tempel JSON (list string/objek)", height=150,
+                           placeholder='["item1", "item2"] atau [{"nama":"A"}]')
         up = st.file_uploader("atau upload file .json", type=["json"])
         if st.button("Tambahkan ke stok hari ini"):
             try:
@@ -398,10 +372,7 @@ def admin_page():
                     put("users.json", users)
                 put("wd.json", wd)
                 st.rerun()
-        st.caption(
-            "Riwayat: "
-            + ", ".join(f"{w['user']} {rp(w['amount'])} {w['status']}" for w in wd[-10:] if w["status"] != "pending")
-        )
+        st.caption("Riwayat: " + ", ".join(f"{w['user']} {rp(w['amount'])} {w['status']}" for w in wd[-10:] if w["status"] != "pending"))
 
     with t_up:
         proofs = get("proofs.json", [])
@@ -431,50 +402,128 @@ def admin_page():
                 p["status"] = "ditolak"
                 put("proofs.json", proofs)
                 st.rerun()
-        st.caption(
-            f"Disetujui: {sum(1 for p in proofs if p['status']=='disetujui')}, "
-            f"ditolak: {sum(1 for p in proofs if p['status']=='ditolak')}"
-        )
+        st.caption(f"Disetujui: {sum(1 for p in proofs if p['status']=='disetujui')}, ditolak: {sum(1 for p in proofs if p['status']=='ditolak')}")
 
     with t_set:
-        s = get("settings.json", {"text": ""})
-        txt = st.text_area("Teks untuk user", value=s.get("text", ""), height=200)
+        cfg = get("settings.json", {"text": ""})
+        txt = st.text_area("Teks untuk user", value=cfg.get("text", ""), height=200)
         if st.button("Simpan teks"):
-            put("settings.json", {"text": txt})
+            cfg["text"] = txt
+            put("settings.json", cfg)
+            st.success("Tersimpan.")
+
+    with t_home:
+        cfg = get("settings.json", {"text": ""})
+        lic = st.text_area("Lisensi & ketentuan (Markdown, tampil di Beranda)",
+                           value=cfg.get("license", ""), height=300)
+        if st.button("Simpan lisensi"):
+            cfg["license"] = lic
+            put("settings.json", cfg)
             st.success("Tersimpan.")
 
 
-# ---------------- Router ----------------
-st.title("📨 KirimPelanggan")
+# ---------------- Tampilan ----------------
+def inject_css():
+    st.markdown("""
+<style>
+.block-container{max-width:760px;padding-top:2rem}
+.stButton>button,.stFormSubmitButton>button{border-radius:12px;font-weight:600}
+.hero{background:linear-gradient(135deg,#4f46e5,#7c3aed 60%,#db2777);color:#fff;
+ border-radius:20px;padding:28px 24px;margin-bottom:18px;text-align:center}
+.hero h1{margin:0;font-size:2rem;color:#fff}
+.hero p{margin:6px 0 0;opacity:.9}
+.wallet{background:linear-gradient(135deg,#0ea5e9,#4f46e5);color:#fff;border-radius:20px;
+ padding:20px 22px;margin-bottom:14px;box-shadow:0 6px 18px rgba(79,70,229,.3)}
+.wallet .wl{font-size:.85rem;opacity:.85;letter-spacing:.04em;text-transform:uppercase}
+.wallet .wv{font-size:2.1rem;font-weight:800;margin:4px 0}
+.wallet .ws{font-size:.85rem;opacity:.8}
+.step{border:1px solid rgba(128,128,128,.25);border-radius:14px;padding:12px 16px;margin-bottom:10px}
+</style>""", unsafe_allow_html=True)
 
-if st.session_state.get("admin"):
-    admin_page()
-elif st.session_state.get("user"):
-    user_page()
-else:
-    tab_l, tab_r, tab_a = st.tabs(["Masuk", "Daftar", "Admin"])
+
+def navbar():
+    c = st.columns(2)
+    c[0].page_link(P_HOME, label="Beranda", icon="🏠")
+    if st.session_state.get("user"):
+        c[1].page_link(P_USER, label="Dashboard", icon="👛")
+    else:
+        c[1].page_link(P_AUTH, label="Masuk / Daftar", icon="🔑")
+
+
+DOCS = f"""
+### Tata cara penggunaan
+<div class="step"><b>1. Daftar & masuk</b><br>Buat akun, lalu masuk. Saat pertama masuk kamu diminta mengisi rekening bank / e-wallet untuk penarikan.</div>
+<div class="step"><b>2. Minta DB</b><br>Isi jumlah DB (maksimal {DAILY} per hari) lalu tekan <b>Minta</b>. Setiap DB hanya diberikan ke satu pengguna.</div>
+<div class="step"><b>3. Kerjakan sesuai teks</b><br>Gunakan teks yang disediakan admin. Setelah selesai, centang DB tersebut sehingga statusnya menjadi <b>Selesai</b>.</div>
+<div class="step"><b>4. Upload bukti</b><br>Kirim foto bukti. Setelah admin menyetujui, saldo bertambah {rp(RATE)} untuk setiap DB berstatus Selesai.</div>
+<div class="step"><b>5. Withdraw</b><br>Ajukan WD minimal {rp(MIN_WD)}. Admin memproses transfer ke rekening yang kamu daftarkan.</div>
+
+### Aturan penting
+- DB direset otomatis setiap pukul 00.00 WIB. Kerjakan dan upload bukti pada hari yang sama.
+- DB hanya boleh digunakan untuk keperluan yang diarahkan pada teks. Dilarang menyalin, menyimpan, atau membagikan DB ke pihak lain.
+- Hentikan menghubungi pelanggan yang meminta berhenti.
+- Akun yang melanggar dapat diblokir dan saldo ditahan.
+"""
+
+
+def home_page():
+    navbar()
+    st.markdown('<div class="hero"><h1>📨 KirimPelanggan</h1>'
+                '<p>Platform kerja mitra untuk menghubungi pelanggan perusahaan</p></div>',
+                unsafe_allow_html=True)
+    if st.session_state.get("user"):
+        st.page_link(P_USER, label="Buka dashboard", icon="👛")
+    else:
+        st.page_link(P_AUTH, label="Masuk / Daftar sekarang", icon="🔑")
+    st.markdown(DOCS, unsafe_allow_html=True)
+    st.markdown("### Lisensi")
+    lic = get("settings.json", {}).get("license", "").strip()
+    st.markdown(lic or "_Informasi lisensi akan ditampilkan di sini._")
+
+
+def auth_page():
+    if st.session_state.get("user"):
+        st.switch_page(P_USER)
+    navbar()
+    st.markdown('<div class="hero"><h1>Selamat datang 👋</h1>'
+                '<p>Masuk atau buat akun mitra untuk mulai</p></div>',
+                unsafe_allow_html=True)
+    tab_l, tab_r = st.tabs(["Masuk", "Daftar"])
     with tab_l:
-        u = st.text_input("Username", key="lu")
-        p = st.text_input("Password", type="password", key="lp")
-        if st.button("Masuk", type="primary"):
+        with st.form("f_login"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            ok = st.form_submit_button("Masuk", type="primary", use_container_width=True)
+        if ok:
             err = login(u, p)
-            st.error(err) if err else st.rerun()
-    with tab_r:
-        u = st.text_input("Username", key="ru")
-        p = st.text_input("Password", type="password", key="rp")
-        if st.button("Daftar", type="primary"):
-            err = register(u, p)
             if err:
                 st.error(err)
             else:
-                login(u, p)
-                st.rerun()
-    with tab_a:
-        p = st.text_input("Password admin", type="password", key="ap")
-        if st.button("Masuk admin"):
-            if secrets.compare_digest(p, st.secrets["ADMIN_PASSWORD"]):
-                st.session_state.admin = True
-                st.rerun()
+                st.switch_page(P_USER)
+    with tab_r:
+        with st.form("f_reg"):
+            u = st.text_input("Username (huruf/angka, min. 4)")
+            p = st.text_input("Password (min. 6)", type="password")
+            p2 = st.text_input("Ulangi password", type="password")
+            ok = st.form_submit_button("Buat akun", type="primary", use_container_width=True)
+        if ok:
+            if p != p2:
+                st.error("Password tidak sama.")
             else:
-                st.error("Password salah.")
+                err = register(u, p)
+                if err:
+                    st.error(err)
+                else:
+                    login(u, p)
+                    st.switch_page(P_USER)
+
+
+# ---------------- Router ----------------
+P_HOME = st.Page(home_page, title="Beranda", url_path="home", default=True)
+P_AUTH = st.Page(auth_page, title="Masuk", url_path="masuk")
+P_USER = st.Page(user_page, title="Dashboard", url_path="dashboard")
+P_ADMIN = st.Page(admin_page, title="Admin", url_path="admin")
+
+inject_css()
+st.navigation([P_HOME, P_AUTH, P_USER, P_ADMIN], position="hidden").run()
 

@@ -45,7 +45,7 @@ st.set_page_config(page_title="KirimPelanggan", page_icon="📨", layout="center
 
 RATE = 1500
 MIN_WD = 10000
-DAILY = 100
+DAILY = 1000
 WIB = timezone(timedelta(hours=7))
 
 
@@ -929,9 +929,9 @@ def home_page():
     st.markdown("""
     <div class="kp-hero">
       <div class="kp-hero-badge">Platform mitra</div>
-      <h1>Kerjakan tugas pelanggan.<br>Dibayar per entri selesai.</h1>
+      <h1>Kerjakan tugas pelanggan.<br>Dibayar per selesai chat</h1>
       <p>Ambil pekerjaan dari admin, selesaikan, unggah bukti. Saldo masuk setelah
-         diverifikasi. Tarik kapan saja ke rekening atau e-wallet Anda.</p>
+         diverifikasi dalam waktu 15 menit hingga 12 jam. Tarik kapan saja ke rekening atau e-wallet Anda.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -945,7 +945,7 @@ def home_page():
     st.write("")
     s1, s2, s3 = st.columns(3)
     for col, val, lbl in (
-        (s1, rp_short(RATE), "Per entri selesai"),
+        (s1, rp_short(RATE), "Per chat selesai"),
         (s2, str(DAILY), "Klaim maks / hari"),
         (s3, rp_short(MIN_WD), "Minimum penarikan"),
     ):

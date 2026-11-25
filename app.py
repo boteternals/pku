@@ -4,18 +4,28 @@ KirimPelanggan — platform mitra untuk mengerjakan tugas pelanggan.
 Runtime     : Streamlit Community Cloud
 Storage     : S3-compatible (Hugging Face bucket), JSON per-key
 Auth        : PBKDF2-HMAC-SHA256, 120.000 iterasi
-Tema        : mendukung light & dark
 
 Secret (st.secrets):
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET
     S3_REGION          (opsional, default us-east-1)
     ADMIN_PASSWORD
 
+Format input DB (admin)
+-----------------------
+Satu entri per baris di textarea:
+
+    081234567890 Budi
+    081234567891
+    081234567892 Siti
+
+Kolom pertama = nomor, kolom kedua (opsional) = nama. Pemisah spasi atau tab.
+Baris diawali `#` diabaikan. Dedupe otomatis berdasarkan nomor.
+File `.txt`, `.csv`, atau `.json` juga diterima.
+
 Catatan konsistensi
 -------------------
 Read-modify-write JSON di S3 tidak atomik. Diasumsikan satu penulis per key
-pada satu waktu — memadai untuk skala operasional saat ini. Untuk skala lebih
-besar migrasikan ke DynamoDB/SQLite di volume persisten.
+pada satu waktu.
 """
 import hashlib
 import html as html_lib
@@ -33,9 +43,9 @@ from botocore.exceptions import BotoCoreError, ClientError
 # ---------------------------------------------------------------- Konfigurasi
 st.set_page_config(page_title="KirimPelanggan", page_icon="📨", layout="centered")
 
-RATE = 1500      # Rp per entri selesai
-MIN_WD = 10000   # minimal penarikan
-DAILY = 100      # batas klaim per user per hari
+RATE = 1500
+MIN_WD = 10000
+DAILY = 100
 WIB = timezone(timedelta(hours=7))
 
 
@@ -97,7 +107,6 @@ def get_bytes(key):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cleanup(day: str) -> bool:
-    """Hapus data & klaim hari sebelumnya (reset 00.00 WIB)."""
     for prefix in ("db/", "claims/"):
         token = None
         while True:
@@ -123,6 +132,70 @@ except (ClientError, BotoCoreError) as e:
     st.stop()
 
 cleanup(today())
+
+
+# ---------------------------------------------------------------- Parser entri
+def parse_db_lines(raw: str) -> list[dict]:
+    """Parse 'nomor [nama]' per baris menjadi list of dict."""
+    out, seen = [], set()
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split(None, 1)
+        nomor = parts[0].strip()
+        nama = parts[1].strip() if len(parts) > 1 else ""
+        if not nomor or nomor in seen:
+            continue
+        seen.add(nomor)
+        entry = {"nomor": nomor}
+        if nama:
+            entry["nama"] = nama
+        out.append(entry)
+    return out
+
+
+def parse_db_file(up) -> list[dict]:
+    name = (up.name or "").lower()
+    content = up.getvalue()
+    if name.endswith(".json"):
+        data = json.loads(content)
+        if not isinstance(data, list):
+            raise ValueError("Root JSON harus array.")
+        out = []
+        for item in data:
+            if isinstance(item, str):
+                out.extend(parse_db_lines(item))
+            elif isinstance(item, dict):
+                out.append(item)
+            else:
+                raise ValueError(f"Tipe tidak didukung: {type(item).__name__}")
+        return out
+    return parse_db_lines(content.decode("utf-8", errors="replace"))
+
+
+def entry_nomor(d):
+    if isinstance(d, dict):
+        return d.get("nomor") or d.get("number") or d.get("phone") or d.get("hp")
+    return None
+
+
+def entry_nama(d):
+    if isinstance(d, dict):
+        return d.get("nama") or d.get("name")
+    return None
+
+
+def render_entry(col, d):
+    nomor = entry_nomor(d)
+    nama = entry_nama(d)
+    if nomor:
+        col.code(str(nomor), language=None)
+        if nama:
+            col.caption(str(nama))
+    else:
+        col.code(d if isinstance(d, str) else json.dumps(d, ensure_ascii=False),
+                 language=None)
 
 
 # ---------------------------------------------------------------- Auth
@@ -184,7 +257,7 @@ def request_db(user: str, n: int) -> tuple[int, str | None]:
     return len(free), None
 
 
-# ---------------------------------------------------------------- Komponen visual
+# ---------------------------------------------------------------- Komponen
 def is_dark() -> bool:
     try:
         return st.context.theme.type == "dark"
@@ -193,7 +266,6 @@ def is_dark() -> bool:
 
 
 def copy_block(text: str, label: str = "Teks dari admin"):
-    """Blok teks dengan tombol salin (Clipboard API + fallback execCommand)."""
     if not text.strip():
         st.caption("Belum ada teks dari admin.")
         return
@@ -336,11 +408,11 @@ def user_page():
 
         st.markdown('<div class="kp-section-label">2 · Minta entri</div>',
                     unsafe_allow_html=True)
+        sisa = max(1, DAILY - len(mine))
         with st.form("claim_form"):
             n = st.number_input(
                 f"Jumlah (maks {DAILY} per hari)", min_value=1,
-                max_value=max(1, DAILY - len(mine)), value=min(10, max(1, DAILY - len(mine))),
-                step=1,
+                max_value=sisa, value=min(10, sisa), step=1,
             )
             submit = st.form_submit_button("Minta", type="primary", use_container_width=True)
         if submit:
@@ -360,11 +432,7 @@ def user_page():
         for i, item in enumerate(mine):
             with st.container(border=True):
                 left, right = st.columns([4, 1], vertical_alignment="center")
-                d = item["data"]
-                left.code(
-                    d if isinstance(d, str) else json.dumps(d, ensure_ascii=False),
-                    language=None,
-                )
+                render_entry(left, item["data"])
                 val = right.checkbox(
                     "Selesai" if item["status"] else "Belum",
                     value=item["status"], key=f"st_{item['id']}",
@@ -453,7 +521,7 @@ def user_page():
                 st.write(f"`{w['time'][:16]}` · **{rp(w['amount'])}** · {w['status']}")
 
 
-# ---------------------------------------------------------------- Halaman admin
+# ---------------------------------------------------------------- Admin
 def admin_page():
     if not st.session_state.get("admin"):
         st.markdown("""
@@ -491,6 +559,7 @@ def admin_page():
         ["Stok DB", "Pengguna", "Penarikan", "Bukti", "Teks", "Beranda"]
     )
 
+    # ----- Stok DB -----
     with t_db:
         d = today()
         pool = get(f"db/{d}/pool.json", [])
@@ -499,30 +568,64 @@ def admin_page():
             f"Periode {d} (WIB) · total {len(pool)} · terpakai {len(assigned)} "
             f"· sisa {len(pool) - len(assigned)}"
         )
-        raw = st.text_area(
-            "Tempel JSON (array string/objek)", height=150,
-            placeholder='["item1", "item2"] atau [{"nama":"A"}]',
-        )
-        up = st.file_uploader("atau unggah file .json", type=["json"])
-        if st.button("Tambahkan ke stok hari ini", type="primary"):
-            try:
-                data = json.loads(up.getvalue()) if up else json.loads(raw)
-                if not isinstance(data, list):
-                    raise ValueError("Root harus berupa array.")
-                seen = {json.dumps(x["data"], sort_keys=True) for x in pool}
-                added = 0
-                for x in data:
-                    k = json.dumps(x, sort_keys=True)
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    pool.append({"id": uuid.uuid4().hex[:12], "data": x})
-                    added += 1
-                put(f"db/{d}/pool.json", pool)
-                st.success(f"{added} entri ditambahkan (duplikat dilewati).")
-            except Exception as e:
-                st.error(f"JSON tidak valid: {e}")
 
+        st.markdown(
+            "**Format** — satu entri per baris. "
+            "`nomor` atau `nomor<spasi/tab>nama`. Baris diawali `#` diabaikan."
+        )
+        raw = st.text_area(
+            "Daftar entri",
+            height=200,
+            placeholder="081234567890 Budi\n081234567891\n081234567892 Siti",
+            label_visibility="collapsed",
+        )
+
+        up = st.file_uploader(
+            "Atau unggah file .txt / .csv / .json",
+            type=["txt", "csv", "json"], key="db_up",
+        )
+
+        if st.button("Tambahkan ke stok hari ini", type="primary"):
+            entries = None
+            if up is not None:
+                try:
+                    entries = parse_db_file(up)
+                except Exception as e:
+                    st.error(f"File tidak valid: {e}")
+            elif raw.strip():
+                entries = parse_db_lines(raw)
+            else:
+                st.warning("Tempel data atau unggah file terlebih dahulu.")
+
+            if entries is not None:
+                if not entries:
+                    st.warning("Tidak ada entri yang bisa ditambahkan.")
+                else:
+                    existing_nomor = {
+                        entry_nomor(x["data"]) for x in pool if entry_nomor(x["data"])
+                    }
+                    existing_json = {
+                        json.dumps(x["data"], sort_keys=True) for x in pool
+                    }
+                    added = skipped = 0
+                    for e in entries:
+                        n = entry_nomor(e)
+                        key = json.dumps(e, sort_keys=True)
+                        if (n and n in existing_nomor) or key in existing_json:
+                            skipped += 1
+                            continue
+                        if n:
+                            existing_nomor.add(n)
+                        existing_json.add(key)
+                        pool.append({"id": uuid.uuid4().hex[:12], "data": e})
+                        added += 1
+                    put(f"db/{d}/pool.json", pool)
+                    msg = f"{added} entri ditambahkan"
+                    if skipped:
+                        msg += f" · {skipped} duplikat dilewati"
+                    st.success(msg)
+
+    # ----- Pengguna -----
     with t_user:
         st.caption(f"Total pengguna: {len(users)}")
         for u, v in users.items():
@@ -550,6 +653,7 @@ def admin_page():
                     put("users.json", users)
                     st.rerun()
 
+    # ----- Penarikan -----
     with t_wd:
         wd = get("wd.json", [])
         pending = [w for w in wd if w["status"] == "pending"]
@@ -579,6 +683,7 @@ def admin_page():
             )
         )
 
+    # ----- Bukti -----
     with t_up:
         proofs = get("proofs.json", [])
         pending = [p for p in proofs if p["status"] == "pending"]
@@ -614,6 +719,7 @@ def admin_page():
             f"ditolak: {sum(1 for p in proofs if p['status'] == 'ditolak')}"
         )
 
+    # ----- Teks -----
     with t_set:
         cfg = get("settings.json", {"text": ""})
         txt = st.text_area("Teks untuk pengguna", value=cfg.get("text", ""), height=200)
@@ -622,6 +728,7 @@ def admin_page():
             put("settings.json", cfg)
             st.success("Tersimpan.")
 
+    # ----- Beranda -----
     with t_home:
         cfg = get("settings.json", {"text": ""})
         lic = st.text_area(
@@ -657,7 +764,6 @@ code, pre, .kp-mono {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace !important;
 }
 
-/* Tombol */
 .stButton > button, .stFormSubmitButton > button {
   border-radius: 8px; font-weight: 500; transition: all .15s ease;
 }
@@ -665,7 +771,6 @@ code, pre, .kp-mono {
   font-weight: 600;
 }
 
-/* Nav link */
 a[data-testid="stPageLink-NavLink"] {
   padding: 8px 14px !important;
   border-radius: 8px !important;
@@ -679,16 +784,12 @@ a[data-testid="stPageLink-NavLink"]:hover {
   border-color: rgba(128,128,128,.18) !important;
 }
 
-/* Container border */
 [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px !important; }
-
-/* Input & uploader */
 .stTextInput input, .stNumberInput input, .stTextArea textarea { border-radius: 8px !important; }
 [data-testid="stFileUploader"] section {
   border-radius: 10px; border-style: dashed !important;
 }
 
-/* Brand */
 .kp-brand {
   display: flex; align-items: center; gap: 10px;
   font-weight: 700; font-size: 1rem; letter-spacing: -0.02em;
@@ -699,7 +800,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
   background: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.18);
 }
 
-/* Hero */
 .kp-hero {
   position: relative;
   background:
@@ -727,7 +827,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
   margin: 0; max-width: 500px;
 }
 
-/* Saldo */
 .kp-balance {
   background:
     radial-gradient(circle at 100% 0%, rgba(99,102,241,0.22), transparent 55%),
@@ -748,7 +847,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
 }
 .kp-balance-meta { font-size: .82rem; color: #94a3b8; }
 
-/* Stats */
 .kp-stat {
   background: var(--secondary-background-color, rgba(128,128,128,0.06));
   border: 1px solid rgba(128,128,128,0.15);
@@ -763,7 +861,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
   text-transform: uppercase; letter-spacing: .07em; font-weight: 500;
 }
 
-/* Section label */
 .kp-section-label {
   font-size: .7rem; font-weight: 600; letter-spacing: .1em;
   text-transform: uppercase; color: rgba(128,128,128,1);
@@ -771,7 +868,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
 }
 .kp-section-label:first-child { margin-top: 12px; }
 
-/* Steps */
 .kp-steps { display: flex; flex-direction: column; gap: 12px; }
 .kp-step {
   display: flex; gap: 20px;
@@ -790,7 +886,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
 }
 .kp-step-d b { color: inherit; font-weight: 600; }
 
-/* Callout */
 .kp-callout {
   border-radius: 14px; padding: 18px 22px; margin: 8px 0 4px;
   border: 1px solid rgba(128,128,128,0.15);
@@ -804,7 +899,6 @@ a[data-testid="stPageLink-NavLink"]:hover {
 .kp-callout li { margin-bottom: 6px; }
 .kp-callout li:last-child { margin-bottom: 0; }
 
-/* Navbar divider */
 .kp-nav-divider {
   height: 1px; background: rgba(128,128,128,0.15); margin: 6px 0 24px;
 }
@@ -842,9 +936,11 @@ def home_page():
     """, unsafe_allow_html=True)
 
     if st.session_state.get("user"):
-        st.page_link(P_USER, label="Buka dashboard", icon="→")
+        if st.button("Buka dashboard", type="primary", use_container_width=True):
+            st.switch_page(P_USER)
     else:
-        st.page_link(P_AUTH, label="Masuk atau daftar sekarang", icon="→")
+        if st.button("Masuk atau daftar sekarang", type="primary", use_container_width=True):
+            st.switch_page(P_AUTH)
 
     st.write("")
     s1, s2, s3 = st.columns(3)

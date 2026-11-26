@@ -503,6 +503,19 @@ def copy_block(text: str, label: str = "Instruksi & Template Pesan"):
   pre{{margin:0;padding:16px 18px;white-space:pre-wrap;word-break:break-word;
       font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;
       line-height:1.65}}
+button[kind="primary"],
+[data-testid="stBaseButton-primary"],
+[data-testid="stFormSubmitButton"] button[kind="primary"] {
+  background-color: #4f46e5 !important;
+  border-color: #4f46e5 !important;
+  color: #ffffff !important;
+}
+button[kind="primary"]:hover,
+[data-testid="stBaseButton-primary"]:hover,
+[data-testid="stFormSubmitButton"] button[kind="primary"]:hover {
+  background-color: #4338ca !important;
+  border-color: #4338ca !important;
+}
 </style></head><body>
 <div class="wrap">
   <div class="head"><span>{esc(label)}</span>

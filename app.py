@@ -3,21 +3,25 @@ KirimPelanggan — Enterprise Partner Operations Platform.
 
 Runtime     : Streamlit Community Cloud (streamlit.io)
 Storage     : S3-compatible (Hugging Face bucket), per-entity JSON
-Auth        : PBKDF2-HMAC-SHA256, 120.000 iterasi
+Auth        : PBKDF2-HMAC-SHA256, 120.000 iterasi + HMAC Signed Session
 
 Secret (st.secrets):
     S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET
     S3_REGION          (opsional, default us-east-1)
     ADMIN_PASSWORD
+    SESSION_SECRET     (opsional, otomatis diturunkan bila tidak diisi)
 """
+import base64
 import csv
 import hashlib
+import hmac
 import html as html_lib
 import io
 import json
 import math
 import re
 import secrets
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -43,6 +47,7 @@ PAGE_SIZE = 20
 MAX_PROOF_MB = 5
 MAX_PROOF_FILES = 10
 CLAIM_RETENTION_DAYS = 3
+SESSION_TTL = 7 * 86400  # 7 hari
 WIB = timezone(timedelta(hours=7))
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -323,7 +328,72 @@ def fmt_account(acc: dict | None) -> str:
     return f"{acc.get('type', '-')} · {acc.get('number', '-')} · a.n. {acc.get('name', '-')}"
 
 
-# ---------------------------------------------------------------- Auth
+# ---------------------------------------------------------------- Auth & Sesi Persisten
+def _session_secret() -> bytes:
+    raw = st.secrets.get("SESSION_SECRET") or (
+        st.secrets["ADMIN_PASSWORD"] + "|" + st.secrets["S3_SECRET_KEY"]
+    )
+    return hashlib.sha256(raw.encode()).digest()
+
+
+def make_session_token(username: str, pw_hash: str, ttl_seconds: int = SESSION_TTL) -> str:
+    payload = json.dumps({
+        "u": username,
+        "v": pw_hash[:8],
+        "exp": int(time.time()) + ttl_seconds,
+    }, separators=(",", ":")).encode()
+    b64 = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    sig = hmac.new(_session_secret(), b64.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{b64}.{sig}"
+
+
+def verify_session_token(token: str) -> tuple[str, str] | None:
+    try:
+        b64, sig = token.split(".", 1)
+        expected = hmac.new(_session_secret(), b64.encode(), hashlib.sha256).hexdigest()[:24]
+        if not hmac.compare_digest(sig, expected):
+            return None
+        pad = "=" * (-len(b64) % 4)
+        data = json.loads(base64.urlsafe_b64decode(b64 + pad))
+        if int(data["exp"]) < int(time.time()):
+            return None
+        return str(data["u"]), str(data["v"])
+    except Exception:
+        return None
+
+
+def sync_session():
+    """Pulihkan sesi login dari query param token saat tab ter-refresh / kembali dari app lain."""
+    if st.session_state.get("user") and st.session_state.get("sid"):
+        if st.query_params.get("s") != st.session_state.sid:
+            st.query_params["s"] = st.session_state.sid
+        return
+
+    tok = st.query_params.get("s")
+    if not tok:
+        return
+
+    parsed = verify_session_token(tok)
+    if not parsed:
+        st.query_params.pop("s", None)
+        return
+
+    u, ver = parsed
+    rec = get_user(u)
+    if rec and not rec.get("banned") and rec["pw"][:8] == ver:
+        st.session_state.user = u
+        st.session_state.sid = tok
+    else:
+        st.query_params.pop("s", None)
+
+
+def clear_session():
+    st.session_state.pop("user", None)
+    st.session_state.pop("sid", None)
+    st.session_state.pop("acc_prompted", None)
+    st.query_params.pop("s", None)
+
+
 def hash_pw(pw: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 120_000).hex()
 
@@ -355,7 +425,10 @@ def login(username: str, pw: str) -> str | None:
         return "Username atau password salah."
     if rec.get("banned"):
         return "Akun diblokir. Hubungi tim operasional."
+    tok = make_session_token(u, rec["pw"])
     st.session_state.user = u
+    st.session_state.sid = tok
+    st.query_params["s"] = tok
     return None
 
 
@@ -486,6 +559,129 @@ def account_dialog():
         st.rerun()
 
 
+@st.fragment
+def task_list_fragment(user: str, d: str, mine: list[dict]):
+    """Fragment terisolasi agar filter, pencarian, dan pagination tidak me-refresh satu halaman penuh."""
+    if not mine:
+        st.markdown("""
+        <div class="kp-empty">
+          <div class="kp-empty-title">Belum ada tugas diambil hari ini</div>
+          <div class="kp-empty-sub">Gunakan formulir di atas untuk mengambil entri pelanggan dari stok harian.</div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    f1, f2 = st.columns([1.4, 2])
+    filt = f1.selectbox(
+        "Filter status",
+        ["Semua", "Belum selesai", "Selesai (belum kredit)", "Sudah dikredit"],
+        label_visibility="collapsed",
+    )
+    q = f2.text_input(
+        "Cari nomor atau nama",
+        placeholder="Cari nomor atau nama...",
+        label_visibility="collapsed",
+    ).strip().lower()
+
+    indexed = list(enumerate(mine))
+    if filt == "Belum selesai":
+        indexed = [(i, x) for i, x in indexed if not x["status"]]
+    elif filt == "Selesai (belum kredit)":
+        indexed = [(i, x) for i, x in indexed if x["status"] and not x["credited"]]
+    elif filt == "Sudah dikredit":
+        indexed = [(i, x) for i, x in indexed if x["credited"]]
+
+    if q:
+        indexed = [
+            (i, x) for i, x in indexed
+            if q in (str(entry_nomor(x["data"]) or "")).lower()
+            or q in (str(entry_nama(x["data"]) or "")).lower()
+        ]
+
+    total_filtered = len(indexed)
+    total_pages = max(1, math.ceil(total_filtered / PAGE_SIZE))
+    page_key = "task_page_num"
+    if page_key in st.session_state and st.session_state[page_key] > total_pages:
+        st.session_state[page_key] = total_pages
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
+
+    p_col1, p_col2, p_col3 = st.columns([1.4, 1.4, 1.8], vertical_alignment="center")
+    p_col1.caption(f"Menampilkan {total_filtered} dari {len(mine)} entri")
+    if total_pages > 1:
+        cur_page = int(p_col2.number_input(
+            "Halaman", min_value=1, max_value=total_pages, step=1,
+            label_visibility="collapsed", key=page_key,
+        ))
+    else:
+        cur_page = 1
+        p_col2.caption("Halaman 1 / 1")
+
+    start = (cur_page - 1) * PAGE_SIZE
+    page_items = indexed[start:start + PAGE_SIZE]
+
+    if p_col3.button("Tandai Halaman Ini Selesai", use_container_width=True, disabled=not page_items):
+        fresh_mine = get(claim_key(user, d), [])
+        changed_bulk = False
+        for idx, _ in page_items:
+            if idx < len(fresh_mine) and not fresh_mine[idx]["credited"] and not fresh_mine[idx]["status"]:
+                fresh_mine[idx]["status"] = True
+                changed_bulk = True
+        if changed_bulk:
+            put(claim_key(user, d), fresh_mine)
+            st.rerun()
+
+    if not page_items:
+        st.caption("Tidak ada entri yang cocok dengan filter.")
+        return
+
+    with st.form("tasks_batch_form"):
+        new_vals = {}
+        for pos, (idx, item) in enumerate(page_items):
+            nomor = entry_nomor(item["data"])
+            nama = entry_nama(item["data"])
+            row_l, row_m, row_r = st.columns([2.6, 1.2, 1], vertical_alignment="center")
+            if nomor:
+                row_l.code(str(nomor), language=None)
+                if nama:
+                    row_l.caption(str(nama))
+            else:
+                row_l.code(json.dumps(item["data"], ensure_ascii=False), language=None)
+
+            if item["credited"]:
+                row_m.markdown(badge_html("terkredit"), unsafe_allow_html=True)
+            elif item["status"]:
+                row_m.markdown(badge_html("selesai"), unsafe_allow_html=True)
+            else:
+                row_m.markdown(badge_html("belum"), unsafe_allow_html=True)
+
+            new_vals[idx] = row_r.checkbox(
+                "Selesai",
+                value=item["status"],
+                key=f"chk_{d}_{item['id']}",
+                disabled=item["credited"],
+            )
+            if pos < len(page_items) - 1:
+                st.markdown('<div class="kp-row-sep"></div>', unsafe_allow_html=True)
+
+        save_tasks = st.form_submit_button(
+            "Simpan Perubahan Status", type="primary", use_container_width=True
+        )
+    if save_tasks:
+        fresh_mine = get(claim_key(user, d), [])
+        changed = False
+        for idx, val in new_vals.items():
+            if idx < len(fresh_mine) and not fresh_mine[idx]["credited"] and fresh_mine[idx]["status"] != val:
+                fresh_mine[idx]["status"] = val
+                changed = True
+        if changed:
+            put(claim_key(user, d), fresh_mine)
+            st.success("Status pekerjaan disimpan.")
+            st.rerun()
+        else:
+            st.info("Tidak ada perubahan status.")
+
+
 # ---------------------------------------------------------------- Halaman User
 def user_page():
     if not st.session_state.get("user"):
@@ -493,7 +689,7 @@ def user_page():
     user = st.session_state.user
     me = get_user(user)
     if not me or me.get("banned"):
-        st.session_state.pop("user", None)
+        clear_session()
         st.switch_page(P_AUTH)
 
     if not me.get("account") and not st.session_state.get("acc_prompted"):
@@ -503,7 +699,7 @@ def user_page():
     top = st.columns([4, 1.2], vertical_alignment="center")
     status_pill = badge_html("aktif") if me.get("account") else '<span class="kp-badge kp-badge-warn">Rekening Belum Diisi</span>'
     top[0].markdown(
-        f'<div class="kp-user-head">'
+        f'<div class="kp-nav-anchor kp-user-head">'
         f'  <div class="kp-avatar">{esc(user[:2].upper())}</div>'
         f'  <div>'
         f'    <div class="kp-eyebrow">Mitra Terdaftar</div>'
@@ -516,8 +712,7 @@ def user_page():
         unsafe_allow_html=True,
     )
     if top[1].button("Keluar", use_container_width=True):
-        st.session_state.pop("user", None)
-        st.session_state.pop("acc_prompted", None)
+        clear_session()
         st.switch_page(P_HOME)
 
     if not me.get("account"):
@@ -606,120 +801,7 @@ def user_page():
                     st.rerun()
 
         st.markdown('<div class="kp-section-label">3 · Daftar Tugas Pelanggan</div>', unsafe_allow_html=True)
-        if not mine:
-            st.markdown("""
-            <div class="kp-empty">
-              <div class="kp-empty-title">Belum ada tugas diambil hari ini</div>
-              <div class="kp-empty-sub">Gunakan formulir di atas untuk mengambil entri pelanggan dari stok harian.</div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            f1, f2 = st.columns([1.4, 2])
-            filt = f1.selectbox(
-                "Filter status",
-                ["Semua", "Belum selesai", "Selesai (belum kredit)", "Sudah dikredit"],
-                label_visibility="collapsed",
-            )
-            q = f2.text_input(
-                "Cari nomor atau nama",
-                placeholder="Cari nomor atau nama...",
-                label_visibility="collapsed",
-            ).strip().lower()
-
-            indexed = list(enumerate(mine))
-            if filt == "Belum selesai":
-                indexed = [(i, x) for i, x in indexed if not x["status"]]
-            elif filt == "Selesai (belum kredit)":
-                indexed = [(i, x) for i, x in indexed if x["status"] and not x["credited"]]
-            elif filt == "Sudah dikredit":
-                indexed = [(i, x) for i, x in indexed if x["credited"]]
-
-            if q:
-                indexed = [
-                    (i, x) for i, x in indexed
-                    if q in (str(entry_nomor(x["data"]) or "")).lower()
-                    or q in (str(entry_nama(x["data"]) or "")).lower()
-                ]
-
-            total_filtered = len(indexed)
-            total_pages = max(1, math.ceil(total_filtered / PAGE_SIZE))
-            page_key = "task_page_num"
-            if page_key in st.session_state and st.session_state[page_key] > total_pages:
-                st.session_state[page_key] = total_pages
-            if page_key not in st.session_state:
-                st.session_state[page_key] = 1
-
-            p_col1, p_col2, p_col3 = st.columns([1.4, 1.4, 1.8], vertical_alignment="center")
-            p_col1.caption(f"Menampilkan {total_filtered} dari {len(mine)} entri")
-            if total_pages > 1:
-                cur_page = int(p_col2.number_input(
-                    "Halaman", min_value=1, max_value=total_pages, step=1,
-                    label_visibility="collapsed", key=page_key,
-                ))
-            else:
-                cur_page = 1
-                p_col2.caption("Halaman 1 / 1")
-
-            start = (cur_page - 1) * PAGE_SIZE
-            page_items = indexed[start:start + PAGE_SIZE]
-
-            if p_col3.button("Tandai Halaman Ini Selesai", use_container_width=True, disabled=not page_items):
-                changed_bulk = False
-                for idx, item in page_items:
-                    if not item["credited"] and not item["status"]:
-                        mine[idx]["status"] = True
-                        changed_bulk = True
-                if changed_bulk:
-                    put(claim_key(user, d), mine)
-                    st.rerun()
-
-            if not page_items:
-                st.caption("Tidak ada entri yang cocok dengan filter.")
-            else:
-                with st.form("tasks_batch_form"):
-                    new_vals = {}
-                    for pos, (idx, item) in enumerate(page_items):
-                        nomor = entry_nomor(item["data"])
-                        nama = entry_nama(item["data"])
-                        row_l, row_m, row_r = st.columns([2.6, 1.2, 1], vertical_alignment="center")
-                        if nomor:
-                            row_l.code(str(nomor), language=None)
-                            if nama:
-                                row_l.caption(str(nama))
-                        else:
-                            row_l.code(json.dumps(item["data"], ensure_ascii=False), language=None)
-
-                        if item["credited"]:
-                            row_m.markdown(badge_html("terkredit"), unsafe_allow_html=True)
-                        elif item["status"]:
-                            row_m.markdown(badge_html("selesai"), unsafe_allow_html=True)
-                        else:
-                            row_m.markdown(badge_html("belum"), unsafe_allow_html=True)
-
-                        new_vals[idx] = row_r.checkbox(
-                            "Selesai",
-                            value=item["status"],
-                            key=f"chk_{d}_{item['id']}",
-                            disabled=item["credited"],
-                        )
-                        if pos < len(page_items) - 1:
-                            st.markdown('<div class="kp-row-sep"></div>', unsafe_allow_html=True)
-
-                    save_tasks = st.form_submit_button(
-                        "Simpan Perubahan Status", type="primary", use_container_width=True
-                    )
-                if save_tasks:
-                    changed = False
-                    for idx, val in new_vals.items():
-                        if not mine[idx]["credited"] and mine[idx]["status"] != val:
-                            mine[idx]["status"] = val
-                            changed = True
-                    if changed:
-                        put(claim_key(user, d), mine)
-                        st.success("Status pekerjaan disimpan.")
-                        st.rerun()
-                    else:
-                        st.info("Tidak ada perubahan status.")
+        task_list_fragment(user, d, mine)
 
         st.markdown('<div class="kp-section-label">4 · Unggah Bukti Pengerjaan</div>', unsafe_allow_html=True)
         if pending_verif == 0:
@@ -881,7 +963,7 @@ def admin_page():
 
     top = st.columns([4, 1.2], vertical_alignment="center")
     top[0].markdown(
-        '<div><div class="kp-eyebrow">Internal Operations</div>'
+        '<div class="kp-nav-anchor"><div class="kp-eyebrow">Internal Operations</div>'
         '<div style="font-size:1.3rem;font-weight:700;">Admin Console</div></div>',
         unsafe_allow_html=True,
     )
@@ -1196,6 +1278,17 @@ def inject_css():
   --kp-border: rgba(148, 163, 184, 0.24);
   --kp-surface: var(--secondary-background-color, rgba(148, 163, 184, 0.08));
   --kp-muted: {muted_color};
+}}
+
+/* Hilangkan tampilan bawaan Streamlit agar tampil seperti web biasa */
+header[data-testid="stHeader"],
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],
+#MainMenu,
+footer {{
+  display: none !important;
+  visibility: hidden !important;
 }}
 
 html, body, [class*="css"], .stApp {{
@@ -1695,4 +1788,5 @@ P_USER = st.Page(user_page, title="Dashboard", url_path="dashboard")
 P_ADMIN = st.Page(admin_page, title="Admin", url_path="admin")
 
 inject_css()
+sync_session()
 st.navigation([P_HOME, P_AUTH, P_USER, P_ADMIN], position="hidden").run()

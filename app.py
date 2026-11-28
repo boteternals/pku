@@ -15,7 +15,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 st.set_page_config(page_title="KirimPelanggan — Platform Kemitraan", page_icon="📨", layout="centered", initial_sidebar_state="collapsed")
 
-RATE, MIN_WD, DAILY = 1500, 10000, 1000
+RATE, MIN_WD, DAILY = 700, 10000, 1000
 PAGE_SIZE, MAX_PROOF_MB, MAX_PROOF_FILES = 20, 5, 10
 CLAIM_RETENTION_DAYS, SESSION_TTL = 3, 7 * 86400
 WIB = timezone(timedelta(hours=7))
